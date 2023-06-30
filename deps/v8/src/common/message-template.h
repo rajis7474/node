@@ -34,6 +34,7 @@ namespace internal {
   T(ArgumentsDisallowedInInitializerAndStaticBlock,                            \
     "'arguments' is not allowed in class field initializer or static "         \
     "initialization block")                                                    \
+  T(ArgumentIsNonObject, "% argument must be an object")                       \
   T(ArrayBufferDetachKeyDoesntMatch,                                           \
     "Provided key doesn't match [[ArrayBufferDetachKey]]")                     \
   T(ArrayBufferTooShort,                                                       \
@@ -100,7 +101,7 @@ namespace internal {
   T(DeclarationMissingInitializer, "Missing initializer in % declaration")     \
   T(DefineDisallowed, "Cannot define property %, object is not extensible")    \
   T(DefineDisallowedFixedLayout,                                               \
-    "Cannot define property %, object is fixed layout")                        \
+    "Cannot define property %, object has fixed layout")                       \
   T(DetachedOperation, "Cannot perform % on a detached ArrayBuffer")           \
   T(DoNotUse, "Do not use %; %")                                               \
   T(DuplicateTemplateProperty, "Object template has duplicate property '%'")   \
@@ -130,6 +131,8 @@ namespace internal {
     "RegExp exec method returned something other than an Object or null")      \
   T(InvalidUnit, "Invalid unit argument for %() '%'")                          \
   T(IterableYieldedNonString, "Iterable yielded % which is not a string")      \
+  T(IteratorReduceNoInitial,                                                   \
+    "Reduce of a done iterator with no initial value")                         \
   T(IteratorResultNotAnObject, "Iterator result % is not an object")           \
   T(SpreadIteratorSymbolNonCallable,                                           \
     "Spread syntax requires ...iterable[Symbol.iterator] to be a function")    \
@@ -137,6 +140,7 @@ namespace internal {
     "% requires that the property of the first argument, "                     \
     "items[Symbol.iterator], when exists, be a function")                      \
   T(IteratorValueNotAnObject, "Iterator value % is not an entry object")       \
+  T(KeysMethodInvalid, "Result of the keys method is not an object")           \
   T(LanguageID, "Language ID should be string or object.")                     \
   T(LocaleNotEmpty,                                                            \
     "First argument to Intl.Locale constructor can't be empty or missing")     \
@@ -189,6 +193,7 @@ namespace internal {
   T(NotInt32OrBigInt64TypedArray,                                              \
     "% is not an int32 or BigInt64 typed array.")                              \
   T(NotSharedTypedArray, "% is not a shared typed array.")                     \
+  T(ObjectFixedLayout, "Cannot add property %, object has fixed layout")       \
   T(ObjectGetterExpectingFunction,                                             \
     "Object.prototype.__defineGetter__: Expecting function")                   \
   T(ObjectGetterCallable, "Getter must be a function: %")                      \
@@ -316,6 +321,7 @@ namespace internal {
     "Incorrect RelativeDateTimeFormatter provided")                            \
   T(ResolverNotAFunction, "Promise resolver % is not a function")              \
   T(ReturnMethodNotCallable, "The iterator's 'return' method is not callable") \
+  T(SizeIsNaN, "The .size property is NaN")                                    \
   T(SharedArrayBufferTooShort,                                                 \
     "Derived SharedArrayBuffer constructor created a buffer which was too "    \
     "small")                                                                   \
@@ -398,8 +404,6 @@ namespace internal {
     "maximumFractionDigits not equal to minimumFractionDigits")                \
   T(NormalizationForm, "The normalization form should be one of %.")           \
   T(OutOfMemory, "%: Out of memory")                                           \
-  T(ParameterOfFunctionOutOfRange,                                             \
-    "Paramenter % of function %() is % and out of range")                      \
   T(ZeroDigitNumericSeparator,                                                 \
     "Numeric separator can not be used after leading 0.")                      \
   T(NumberFormatRange, "% argument must be between 0 and 100")                 \
@@ -669,6 +673,7 @@ namespace internal {
   T(WasmTrapBadSuspender, "invalid suspender object for suspend")              \
   T(WasmTrapStringIsolatedSurrogate,                                           \
     "Failed to encode string as UTF-8: contains unpaired surrogate")           \
+  T(WasmTrapSuspendJSFrames, "trying to suspend JS frames")                    \
   T(WasmExceptionError, "wasm exception")                                      \
   T(WasmObjectsAreOpaque, "WebAssembly objects are opaque")                    \
   /* Asm.js validation related */                                              \

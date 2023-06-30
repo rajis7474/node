@@ -10,9 +10,11 @@
 #include "src/execution/isolate.h"
 #include "src/flags/flags.h"
 #include "src/handles/persistent-handles.h"
+#include "src/heap/parked-scope.h"
 #include "src/maglev/maglev-compilation-info.h"
 #include "src/maglev/maglev-compiler.h"
 #include "src/maglev/maglev-graph-labeller.h"
+#include "src/maglev/maglev-pipeline-statistics.h"
 #include "src/objects/js-function-inl.h"
 #include "src/utils/identity-map.h"
 #include "src/utils/locked-queue-inl.h"
@@ -24,7 +26,6 @@ namespace compiler {
 
 void JSHeapBroker::AttachLocalIsolateForMaglev(
     maglev::MaglevCompilationInfo* info, LocalIsolate* local_isolate) {
-  set_canonical_handles(info->DetachCanonicalHandles());
   DCHECK_NULL(local_isolate_);
   local_isolate_ = local_isolate;
   DCHECK_NOT_NULL(local_isolate_);
@@ -39,7 +40,6 @@ void JSHeapBroker::DetachLocalIsolateForMaglev(
   std::unique_ptr<PersistentHandles> ph =
       local_isolate_->heap()->DetachPersistentHandles();
   local_isolate_ = nullptr;
-  info->set_canonical_handles(DetachCanonicalHandles());
   info->set_persistent_handles(std::move(ph));
 }
 
@@ -78,53 +78,94 @@ void ExportedMaglevCompilationInfo::set_canonical_handles(
 
 // static
 std::unique_ptr<MaglevCompilationJob> MaglevCompilationJob::New(
-    Isolate* isolate, Handle<JSFunction> function) {
-  auto info = maglev::MaglevCompilationInfo::New(isolate, function);
+    Isolate* isolate, Handle<JSFunction> function, BytecodeOffset osr_offset) {
+  auto info = maglev::MaglevCompilationInfo::New(isolate, function, osr_offset);
   return std::unique_ptr<MaglevCompilationJob>(
-      new MaglevCompilationJob(std::move(info)));
+      new MaglevCompilationJob(isolate, std::move(info)));
 }
 
+namespace {
+
+MaglevPipelineStatistics* CreatePipelineStatistics(
+    Isolate* isolate, MaglevCompilationInfo* compilation_info,
+    compiler::ZoneStats* zone_stats) {
+  MaglevPipelineStatistics* pipeline_stats = nullptr;
+  bool tracing_enabled;
+  TRACE_EVENT_CATEGORY_GROUP_ENABLED(TRACE_DISABLED_BY_DEFAULT("v8.maglev"),
+                                     &tracing_enabled);
+  if (tracing_enabled || v8_flags.maglev_stats || v8_flags.maglev_stats_nvp) {
+    pipeline_stats = new MaglevPipelineStatistics(
+        compilation_info, isolate->GetMaglevStatistics(), zone_stats);
+  }
+  return pipeline_stats;
+}
+
+}  // namespace
+
 MaglevCompilationJob::MaglevCompilationJob(
-    std::unique_ptr<MaglevCompilationInfo>&& info)
+    Isolate* isolate, std::unique_ptr<MaglevCompilationInfo>&& info)
     : OptimizedCompilationJob(kMaglevCompilerName, State::kReadyToPrepare),
-      info_(std::move(info)) {
-  DCHECK(v8_flags.maglev);
+      info_(std::move(info)),
+      zone_stats_(isolate->allocator()),
+      pipeline_statistics_(
+          CreatePipelineStatistics(isolate, info_.get(), &zone_stats_)) {
+  DCHECK(maglev::IsMaglevEnabled());
 }
 
 MaglevCompilationJob::~MaglevCompilationJob() = default;
 
 CompilationJob::Status MaglevCompilationJob::PrepareJobImpl(Isolate* isolate) {
+  BeginPhaseKind("V8.MaglevPrepareJob");
   if (info()->collect_source_positions()) {
     SharedFunctionInfo::EnsureSourcePositionsAvailable(
         isolate,
         info()->toplevel_compilation_unit()->shared_function_info().object());
   }
+  EndPhaseKind();
   // TODO(v8:7700): Actual return codes.
   return CompilationJob::SUCCEEDED;
 }
 
 CompilationJob::Status MaglevCompilationJob::ExecuteJobImpl(
     RuntimeCallStats* stats, LocalIsolate* local_isolate) {
+  BeginPhaseKind("V8.MaglevExecuteJob");
   LocalIsolateScope scope{info(), local_isolate};
   if (!maglev::MaglevCompiler::Compile(local_isolate, info())) {
     return CompilationJob::FAILED;
   }
+  EndPhaseKind();
   // TODO(v8:7700): Actual return codes.
   return CompilationJob::SUCCEEDED;
 }
 
 CompilationJob::Status MaglevCompilationJob::FinalizeJobImpl(Isolate* isolate) {
+  BeginPhaseKind("V8.MaglevFinalizeJob");
   Handle<Code> code;
   if (!maglev::MaglevCompiler::GenerateCode(isolate, info()).ToHandle(&code)) {
     return CompilationJob::FAILED;
   }
-  info()->toplevel_compilation_unit()->function().object()->set_code(*code);
+  info()->set_code(code);
+  // Drop canonical handles during finalization, to avoid (in the case of
+  // background job destruction) needing to unpark the local isolate on the
+  // background thread for unregistering the identity map's strong roots.
+  info()->DetachCanonicalHandles()->Clear();
+  EndPhaseKind();
   return CompilationJob::SUCCEEDED;
 }
 
-Handle<JSFunction> MaglevCompilationJob::function() const {
-  return info_->toplevel_compilation_unit()->function().object();
+MaybeHandle<Code> MaglevCompilationJob::code() const {
+  return info_->get_code();
 }
+
+Handle<JSFunction> MaglevCompilationJob::function() const {
+  return info_->toplevel_function();
+}
+
+BytecodeOffset MaglevCompilationJob::osr_offset() const {
+  return info_->toplevel_osr_offset();
+}
+
+bool MaglevCompilationJob::is_osr() const { return info_->toplevel_is_osr(); }
 
 bool MaglevCompilationJob::specialize_to_function_context() const {
   return info_->specialize_to_function_context();
@@ -145,6 +186,32 @@ void MaglevCompilationJob::RecordCompilationStats(Isolate* isolate) const {
     counters->maglev_optimize_total_time()->AddSample(
         static_cast<int>(ElapsedTime().InMicroseconds()));
   }
+  if (v8_flags.trace_opt_stats) {
+    static double compilation_time = 0.0;
+    static int compiled_functions = 0;
+    static int code_size = 0;
+
+    compilation_time += (time_taken_to_prepare_.InMillisecondsF() +
+                         time_taken_to_execute_.InMillisecondsF() +
+                         time_taken_to_finalize_.InMillisecondsF());
+    compiled_functions++;
+    code_size += function()->shared().SourceSize();
+    PrintF(
+        "[maglev] Compiled: %d functions with %d byte source size in %fms.\n",
+        compiled_functions, code_size, compilation_time);
+  }
+}
+
+void MaglevCompilationJob::BeginPhaseKind(const char* name) {
+  if (V8_UNLIKELY(pipeline_statistics_ != nullptr)) {
+    pipeline_statistics_->BeginPhaseKind(name);
+  }
+}
+
+void MaglevCompilationJob::EndPhaseKind() {
+  if (V8_UNLIKELY(pipeline_statistics_ != nullptr)) {
+    pipeline_statistics_->EndPhaseKind();
+  }
 }
 
 // The JobTask is posted to V8::GetCurrentPlatform(). It's responsible for
@@ -158,7 +225,14 @@ class MaglevConcurrentDispatcher::JobTask final : public v8::JobTask {
     LocalIsolate local_isolate(isolate(), ThreadKind::kBackground);
     DCHECK(local_isolate.heap()->IsParked());
 
-    while (!incoming_queue()->IsEmpty() && !delegate->ShouldYield()) {
+    // You can't call ShouldYield twice in a row, so cache its value.
+    bool should_yield = false;
+    bool job_was_executed = false;
+    while (!incoming_queue()->IsEmpty()) {
+      if (delegate->ShouldYield()) {
+        should_yield = true;
+        break;
+      }
       std::unique_ptr<MaglevCompilationJob> job;
       if (!incoming_queue()->Dequeue(&job)) break;
       DCHECK_NOT_NULL(job);
@@ -170,20 +244,44 @@ class MaglevConcurrentDispatcher::JobTask final : public v8::JobTask {
       CompilationJob::Status status =
           job->ExecuteJob(local_isolate.runtime_call_stats(), &local_isolate);
       if (status == CompilationJob::SUCCEEDED) {
+        job_was_executed = true;
         outgoing_queue()->Enqueue(std::move(job));
       }
     }
-    isolate()->stack_guard()->RequestInstallMaglevCode();
+    if (job_was_executed) {
+      isolate()->stack_guard()->RequestInstallMaglevCode();
+    }
+    if (should_yield) return;
+
+    // Maglev jobs aren't cheap to destruct, so destroy them here in the
+    // background thread rather than on the main thread.
+    while (!destruction_queue()->IsEmpty()) {
+      if (delegate->ShouldYield()) {
+        should_yield = true;
+        break;
+      }
+      std::unique_ptr<MaglevCompilationJob> job;
+      if (!destruction_queue()->Dequeue(&job)) break;
+      DCHECK_NOT_NULL(job);
+      job.reset();
+    }
   }
 
-  size_t GetMaxConcurrency(size_t) const override {
-    return incoming_queue()->size();
+  size_t GetMaxConcurrency(size_t worker_count) const override {
+    size_t num_tasks =
+        incoming_queue()->size() + destruction_queue()->size() + worker_count;
+    size_t max_threads = v8_flags.concurrent_maglev_max_threads;
+    if (max_threads > 0) {
+      return std::min(max_threads, num_tasks);
+    }
+    return num_tasks;
   }
 
  private:
   Isolate* isolate() const { return dispatcher_->isolate_; }
   QueueT* incoming_queue() const { return &dispatcher_->incoming_queue_; }
   QueueT* outgoing_queue() const { return &dispatcher_->outgoing_queue_; }
+  QueueT* destruction_queue() const { return &dispatcher_->destruction_queue_; }
 
   MaglevConcurrentDispatcher* const dispatcher_;
   const Handle<JSFunction> function_;
@@ -191,9 +289,25 @@ class MaglevConcurrentDispatcher::JobTask final : public v8::JobTask {
 
 MaglevConcurrentDispatcher::MaglevConcurrentDispatcher(Isolate* isolate)
     : isolate_(isolate) {
-  if (v8_flags.concurrent_recompilation && v8_flags.maglev) {
+  bool enable = v8_flags.concurrent_recompilation && maglev::IsMaglevEnabled();
+  if (enable) {
+    bool is_tracing =
+        v8_flags.print_maglev_code || v8_flags.trace_maglev_graph_building ||
+        v8_flags.trace_maglev_inlining || v8_flags.print_maglev_deopt_verbose ||
+        v8_flags.print_maglev_graph || v8_flags.print_maglev_graphs ||
+        v8_flags.trace_maglev_phi_untagging || v8_flags.trace_maglev_regalloc;
+
+    if (is_tracing) {
+      PrintF("Concurrent maglev has been disabled for tracing.\n");
+      enable = false;
+    }
+  }
+  if (enable) {
+    TaskPriority priority = v8_flags.concurrent_maglev_high_priority_threads
+                                ? TaskPriority::kUserBlocking
+                                : TaskPriority::kUserVisible;
     job_handle_ = V8::GetCurrentPlatform()->PostJob(
-        TaskPriority::kUserVisible, std::make_unique<JobTask>(this));
+        priority, std::make_unique<JobTask>(this));
     DCHECK(is_enabled());
   } else {
     DCHECK(!is_enabled());
@@ -226,6 +340,13 @@ void MaglevConcurrentDispatcher::FinalizeFinishedJobs() {
     RCS_SCOPE(isolate_,
               RuntimeCallCounterId::kOptimizeConcurrentFinalizeMaglev);
     Compiler::FinalizeMaglevCompilationJob(job.get(), isolate_);
+    if (v8_flags.maglev_destroy_on_background) {
+      // Maglev jobs aren't cheap to destruct, so re-enqueue them for
+      // destruction on a background thread.
+      destruction_queue_.Enqueue(std::move(job));
+    } else {
+      job.reset();
+    }
   }
 }
 
@@ -236,6 +357,22 @@ void MaglevConcurrentDispatcher::AwaitCompileJobs() {
   job_handle_ = V8::GetCurrentPlatform()->PostJob(
       TaskPriority::kUserVisible, std::make_unique<JobTask>(this));
   DCHECK(incoming_queue_.IsEmpty());
+}
+
+void MaglevConcurrentDispatcher::Flush(BlockingBehavior behavior) {
+  while (!incoming_queue_.IsEmpty()) {
+    std::unique_ptr<MaglevCompilationJob> job;
+    incoming_queue_.Dequeue(&job);
+  }
+  if (behavior == BlockingBehavior::kBlock) {
+    job_handle_->Cancel();
+    job_handle_ = V8::GetCurrentPlatform()->PostJob(
+        TaskPriority::kUserVisible, std::make_unique<JobTask>(this));
+  }
+  while (!outgoing_queue_.IsEmpty()) {
+    std::unique_ptr<MaglevCompilationJob> job;
+    outgoing_queue_.Dequeue(&job);
+  }
 }
 
 }  // namespace maglev
